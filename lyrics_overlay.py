@@ -44,13 +44,17 @@ LRCLIB_SEARCH = "https://lrclib.net/api/search"
 USER_AGENT = "lyrics-overlay/1.0 (personal terminal app)"
 SEARCH_TIMEOUT = 4
 CACHE_PATH = os.path.expanduser("~/.cache/lyrics-overlay/cache.json")
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 # playerctl calls (~5-10ms each) are only made every RESYNC_INTERVAL; in between,
 # position is interpolated from the system clock so line changes and terminal
 # resizes are checked (and redrawn) every TICK_INTERVAL instead of lagging
 # behind the next subprocess poll.
 RESYNC_INTERVAL = 0.5
 TICK_INTERVAL = 0.05
+# Brief blank flash before redrawing when the new chunk is the exact same
+# word as the one just shown, so a repeated word reads as a fresh instance
+# starting rather than looking like the display just froze.
+BLINK_SECONDS = 0.09
 # Single fixed font, always — no switching between styles as the terminal
 # is resized. If it doesn't fit at the current terminal size (pick_font()
 # checks this against the actual lyrics), render_big() falls back to plain
@@ -120,10 +124,13 @@ def get_now_playing():
     return artist, title, status, position
 
 
-def strip_parens_chars(text: str) -> str:
-    """Drop literal '(' and ')' characters from displayed lyric text (e.g.
-    backing-vocal annotations like "(oh)"), keeping the words inside."""
-    return re.sub(r"\s+", " ", text.replace("(", "").replace(")", "")).strip()
+def clean_display_text(text: str) -> str:
+    """Drop characters we don't want in the big lyric display: literal
+    parens (e.g. "(oh)" backing-vocal annotations, keeping the words
+    inside) and commas/periods (visual clutter blown up to banner size)."""
+    for ch in "(),.":
+        text = text.replace(ch, "")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_lrc(text: str):
@@ -134,7 +141,7 @@ def parse_lrc(text: str):
             continue
         minutes, seconds, content = match.groups()
         timestamp = int(minutes) * 60 + float(seconds)
-        lines.append((timestamp, strip_parens_chars(content)))
+        lines.append((timestamp, clean_display_text(content)))
     lines.sort(key=lambda pair: pair[0])
     return lines
 
@@ -271,7 +278,7 @@ def fetch_lyrics(artist: str, title: str):
                 for candidate in results:
                     if candidate.get("plainLyrics"):
                         plain_lines = [
-                            (0.0, strip_parens_chars(line))
+                            (0.0, clean_display_text(line))
                             for line in candidate["plainLyrics"].splitlines()
                             if line.strip()
                         ]
@@ -530,6 +537,7 @@ def watch():
     last_width = None
     last_height = None
     last_waiting_size = None
+    last_rendered_text = None
     current_font = None
 
     next_resync = 0.0
@@ -548,6 +556,7 @@ def watch():
                     status = None
                     last_idx = None
                     last_status = None
+                    last_rendered_text = None
                     if (width, height) != last_waiting_size:
                         last_waiting_size = (width, height)
                         render_message("waiting for something to play...", width, height)
@@ -565,6 +574,7 @@ def watch():
                     lines, synced = fetch_lyrics(artist, title)
                     last_idx = None
                     last_status = None
+                    last_rendered_text = None
                     current_font = pick_font(lines, width, height) if (lines and synced) else None
 
             if status is None:
@@ -579,8 +589,17 @@ def watch():
                 current_font = pick_font(lines, width, height)
 
             if idx != last_idx or status != last_status or width != last_width or height != last_height:
+                new_text = lines[idx][1] if (lines and synced and idx >= 0) else None
+                if idx != last_idx and new_text is not None and new_text == last_rendered_text:
+                    # Same word as the previous chunk: briefly blank the
+                    # screen so it reads as a fresh instance starting,
+                    # rather than looking frozen/unchanged.
+                    clear_screen()
+                    sys.stdout.flush()
+                    time.sleep(BLINK_SECONDS)
                 last_idx, last_status, last_width, last_height = idx, status, width, height
                 render(status, lines, synced, idx, width, height, current_font)
+                last_rendered_text = new_text
 
             time.sleep(TICK_INTERVAL)
     except KeyboardInterrupt:
